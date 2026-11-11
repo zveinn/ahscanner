@@ -1,8 +1,8 @@
 --[[
 	AH Scanner
-	Opens with the auction house, reads known alchemy recipes, and prices
-	one ingredient at a time, one recipe at a time. Profitable recipes
-	are listed first. The full auction house is never downloaded.
+	Opens with the auction house. When a profession window is open, Scan
+	prices that profession's known recipes, one ingredient at a time.
+	Profitable recipes are listed first. The full auction house is never downloaded.
 ]]
 
 local ADDON = ...
@@ -28,6 +28,8 @@ local placed = false
 local cutPercent = 5
 local marketKey = "Alliance"
 local recipes = {}
+local activeSkill = nil
+local activeName = nil
 local prices = {} -- [itemID] = copper, or false when confirmed unlisted
 local names = {}
 local icons = {}
@@ -39,10 +41,8 @@ local searchPendingStep = nil
 local searchAttempts = {}
 local searchSeen = {} -- item IDs already priced in this scan
 local nextSearchAt = 0
-local weOpenedProfession = false
 local refreshQueued = false
 local scrollOffset = 0
-local snapshotAttempted = false
 
 local SORT_PRICE = {
 	{ sortOrder = 0, reverseSort = false },
@@ -83,8 +83,15 @@ local function CharacterRecord()
 		record = {}
 		db.characters[key] = record
 	end
-	if type(record.recipes) ~= "table" then
-		record.recipes = {}
+	if type(record.professions) ~= "table" then
+		record.professions = {}
+	end
+	-- Older versions stored only alchemy on the character.
+	if type(record.recipes) == "table" and #record.recipes > 0 and not record.professions[ALCHEMY_SKILL] then
+		record.professions[ALCHEMY_SKILL] = { name = "Alchemy", recipes = record.recipes }
+	end
+	if type(record.activeSkill) ~= "number" and record.professions[ALCHEMY_SKILL] then
+		record.activeSkill = ALCHEMY_SKILL
 	end
 	return record
 end
@@ -104,19 +111,38 @@ local function CopyRecipe(recipe)
 	}
 end
 
-local function SaveRecipeList(list, replace)
+local function ProfessionBucket(skillLine, name)
 	local record = CharacterRecord()
-	if not record then return end
+	if not record or type(skillLine) ~= "number" then return nil end
+	local bucket = record.professions[skillLine]
+	if type(bucket) ~= "table" then
+		bucket = { name = name or "Profession", recipes = {} }
+		record.professions[skillLine] = bucket
+	end
+	if type(bucket.recipes) ~= "table" then
+		bucket.recipes = {}
+	end
+	if type(name) == "string" and name ~= "" then
+		bucket.name = name
+	end
+	return bucket
+end
+
+local function SaveRecipeList(list, replace)
+	local bucket = ProfessionBucket(activeSkill, activeName)
+	if not bucket then return end
+	local record = CharacterRecord()
+	if record then record.activeSkill = activeSkill end
 	if replace then
-		record.recipes = {}
+		bucket.recipes = {}
 		for i = 1, #list do
-			record.recipes[i] = CopyRecipe(list[i])
+			bucket.recipes[i] = CopyRecipe(list[i])
 		end
 		return
 	end
 	local byID = {}
-	for i = 1, #record.recipes do
-		local recipe = record.recipes[i]
+	for i = 1, #bucket.recipes do
+		local recipe = bucket.recipes[i]
 		if recipe and recipe.recipeID then
 			byID[recipe.recipeID] = recipe
 		end
@@ -128,15 +154,20 @@ local function SaveRecipeList(list, replace)
 	for _, recipe in pairs(byID) do
 		merged[#merged + 1] = recipe
 	end
-	record.recipes = merged
+	bucket.recipes = merged
 end
 
 local function LoadSavedRecipes()
 	local record = CharacterRecord()
-	if not record then return {} end
+	if not record or type(activeSkill) ~= "number" then return {} end
+	local bucket = record.professions[activeSkill]
+	if type(bucket) ~= "table" or type(bucket.recipes) ~= "table" then return {} end
+	if type(bucket.name) == "string" and bucket.name ~= "" then
+		activeName = bucket.name
+	end
 	local list = {}
-	for i = 1, #record.recipes do
-		local recipe = record.recipes[i]
+	for i = 1, #bucket.recipes do
+		local recipe = bucket.recipes[i]
 		if type(recipe) == "table" and recipe.recipeID and recipe.outputItemID and type(recipe.reagents) == "table" and #recipe.reagents > 0 then
 			list[#list + 1] = CopyRecipe(recipe)
 		end
@@ -291,74 +322,6 @@ local function NoteItem(itemID)
 	end
 end
 
-local function IsAlchemyInfo(info)
-	if type(info) ~= "table" then return false end
-	if info.professionID == ALCHEMY_SKILL or info.parentProfessionID == ALCHEMY_SKILL then
-		return true
-	end
-	if Enum and Enum.Profession and info.profession == Enum.Profession.Alchemy then
-		return true
-	end
-	if type(info.professionName) == "string" and info.professionName:lower():find("alchemy", 1, true) then
-		return true
-	end
-	return false
-end
-
-local function PlayerHasAlchemy()
-	if not GetProfessions or not GetProfessionInfo then
-		return nil
-	end
-	local slots = { GetProfessions() }
-	for i = 1, #slots do
-		local index = slots[i]
-		if index then
-			local name, _, _, _, _, _, skillLine = GetProfessionInfo(index)
-			if skillLine == ALCHEMY_SKILL then
-				return true
-			end
-			if type(name) == "string" and name:lower():find("alchemy", 1, true) then
-				return true
-			end
-			if skillLine and C_TradeSkillUI and C_TradeSkillUI.GetProfessionInfoBySkillLineID then
-				local ok, info = pcall(C_TradeSkillUI.GetProfessionInfoBySkillLineID, skillLine)
-				if ok and IsAlchemyInfo(info) then
-					return true
-				end
-			end
-		end
-	end
-	return false
-end
-
-local function AlchemySkillLine()
-	if GetProfessions and GetProfessionInfo then
-		local slots = { GetProfessions() }
-		for i = 1, #slots do
-			local index = slots[i]
-			if index then
-				local _, _, _, _, _, _, skillLine = GetProfessionInfo(index)
-				if skillLine == ALCHEMY_SKILL then
-					return skillLine
-				end
-				if skillLine and C_TradeSkillUI and C_TradeSkillUI.GetProfessionInfoBySkillLineID then
-					local ok, info = pcall(C_TradeSkillUI.GetProfessionInfoBySkillLineID, skillLine)
-					if ok and IsAlchemyInfo(info) then
-						return skillLine
-					end
-				end
-			end
-		end
-	end
-	if C_TradeSkillUI and C_TradeSkillUI.GetProfessionSkillLineID and Enum and Enum.Profession then
-		local ok, skillLine = pcall(C_TradeSkillUI.GetProfessionSkillLineID, Enum.Profession.Alchemy)
-		if ok and type(skillLine) == "number" and skillLine > 0 then
-			return skillLine
-		end
-	end
-	return ALCHEMY_SKILL
-end
-
 local function ReadSchematic(recipeID)
 	if not (C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic) then
 		return nil
@@ -411,79 +374,126 @@ local function RecipeIsLearned(recipeID)
 	return info.learned and true or false
 end
 
-local function OpenProfessionIsAlchemy()
-	if not C_TradeSkillUI then return false end
-	if C_TradeSkillUI.GetBaseProfessionInfo then
-		local ok, info = pcall(C_TradeSkillUI.GetBaseProfessionInfo)
-		if ok and IsAlchemyInfo(info) then
-			return true
+-- The profession window that is open right now, if its recipe list is ready.
+local function CurrentProfession()
+	if not C_TradeSkillUI then return nil end
+	if C_TradeSkillUI.IsTradeSkillReady and not C_TradeSkillUI.IsTradeSkillReady() then
+		return nil
+	end
+	local skillLine, name
+	if C_TradeSkillUI.GetTradeSkillLine then
+		local ok, a, b = pcall(C_TradeSkillUI.GetTradeSkillLine)
+		if ok then
+			if type(a) == "table" then
+				if type(a.professionID) == "number" and a.professionID > 0 then
+					skillLine = a.professionID
+				elseif type(a.parentProfessionID) == "number" and a.parentProfessionID > 0 then
+					skillLine = a.parentProfessionID
+				end
+				if type(a.professionName) == "string" and a.professionName ~= "" then
+					name = a.professionName
+				elseif type(a.skillLineDisplayName) == "string" and a.skillLineDisplayName ~= "" then
+					name = a.skillLineDisplayName
+				end
+			elseif type(a) == "number" and a > 0 then
+				skillLine = a
+				if type(b) == "string" and b ~= "" then
+					name = b
+				end
+			end
 		end
 	end
-	if C_TradeSkillUI.GetTradeSkillLine then
-		local ok, line, _, _, _, _, parent = pcall(C_TradeSkillUI.GetTradeSkillLine)
-		if ok and (line == ALCHEMY_SKILL or parent == ALCHEMY_SKILL) then
-			return true
+	if C_TradeSkillUI.GetBaseProfessionInfo then
+		local ok, info = pcall(C_TradeSkillUI.GetBaseProfessionInfo)
+		if ok and type(info) == "table" then
+			if not skillLine and type(info.professionID) == "number" and info.professionID > 0 then
+				skillLine = info.professionID
+			end
+			if (not name or name == "") and type(info.professionName) == "string" then
+				name = info.professionName
+			end
 		end
+	end
+	if not skillLine then return nil end
+	if not name or name == "" then name = "Profession" end
+	return skillLine, name
+end
+
+local function RecipeProfession(recipeID)
+	if not (C_TradeSkillUI and C_TradeSkillUI.GetProfessionInfoByRecipeID) then
+		return nil
+	end
+	local ok, info = pcall(C_TradeSkillUI.GetProfessionInfoByRecipeID, recipeID)
+	if not ok or type(info) ~= "table" then return nil end
+	local skill = info.professionID
+	if type(skill) ~= "number" or skill <= 0 then
+		skill = info.parentProfessionID
+	end
+	local name = info.professionName or info.parentProfessionName
+	local parent = info.parentProfessionID
+	if type(skill) ~= "number" or skill <= 0 then skill = nil end
+	if type(parent) ~= "number" or parent <= 0 then parent = nil end
+	if type(name) ~= "string" or name == "" then name = nil end
+	if not skill and not parent and not name then return nil end
+	return skill, parent, name
+end
+
+local function RecipeBelongs(recipeID, skillLine, name)
+	local skill, parent, recipeName = RecipeProfession(recipeID)
+	if not skill and not parent and not recipeName then
+		return nil
+	end
+	if skill == skillLine or parent == skillLine then
+		return true
+	end
+	if recipeName and name and recipeName:lower() == name:lower() then
+		return true
 	end
 	return false
 end
 
-local function ReadOpenAlchemy()
+local function ReadOpenProfession()
 	if not (C_TradeSkillUI and C_TradeSkillUI.GetAllRecipeIDs) then
 		return nil
 	end
-	if C_TradeSkillUI.IsTradeSkillReady and not C_TradeSkillUI.IsTradeSkillReady() then
-		return nil
-	end
-	if not OpenProfessionIsAlchemy() then
+	local skillLine, name = CurrentProfession()
+	if not skillLine then
 		return nil
 	end
 	local ok, ids = pcall(C_TradeSkillUI.GetAllRecipeIDs)
-	if not ok or type(ids) ~= "table" or #ids == 0 then
+	if not ok or type(ids) ~= "table" then
 		return nil
 	end
 	local list = {}
+	local tagged = false
+	local untagged = {}
 	for i = 1, #ids do
 		local recipeID = ids[i]
 		if RecipeIsLearned(recipeID) then
-			local recipe = ReadSchematic(recipeID)
+			local belongs = RecipeBelongs(recipeID, skillLine, name)
+			if belongs == nil then
+				untagged[#untagged + 1] = recipeID
+			else
+				tagged = true
+				if belongs then
+					local recipe = ReadSchematic(recipeID)
+					if recipe then
+						list[#list + 1] = recipe
+					end
+				end
+			end
+		end
+	end
+	-- If the client never says which profession a recipe is, trust the open window.
+	if not tagged then
+		for i = 1, #untagged do
+			local recipe = ReadSchematic(untagged[i])
 			if recipe then
 				list[#list + 1] = recipe
 			end
 		end
 	end
 	return list
-end
-
-local function TryProfessionSpells()
-	local api = C_TradeSkillUI and C_TradeSkillUI.GetProfessionSpells
-	if not api then return nil end
-	local skillLine = AlchemySkillLine()
-	local attempts = {
-		{ skillLine },
-		{ ALCHEMY_SKILL },
-	}
-	if Enum and Enum.Profession and Enum.Profession.Alchemy ~= nil then
-		attempts[#attempts + 1] = { Enum.Profession.Alchemy, skillLine }
-		attempts[#attempts + 1] = { Enum.Profession.Alchemy }
-	end
-	for i = 1, #attempts do
-		local args = attempts[i]
-		local ok, spells = pcall(api, args[1], args[2])
-		if ok and type(spells) == "table" and #spells > 0 then
-			local list = {}
-			for n = 1, #spells do
-				local recipe = ReadSchematic(spells[n])
-				if recipe then
-					list[#list + 1] = recipe
-				end
-			end
-			if #list > 0 then
-				return list
-			end
-		end
-	end
-	return nil
 end
 
 local function UseRecipes(list, replace)
@@ -496,74 +506,6 @@ local function UseRecipes(list, replace)
 		for n = 1, #recipe.reagents do
 			NoteItem(recipe.reagents[n].itemID)
 		end
-	end
-end
-
-local function CloseProfessionIfWeOpenedIt()
-	if not weOpenedProfession then return end
-	weOpenedProfession = false
-	if C_TradeSkillUI and C_TradeSkillUI.CloseTradeSkill then
-		pcall(C_TradeSkillUI.CloseTradeSkill)
-	end
-	if ProfessionsFrame and ProfessionsFrame.Hide then
-		pcall(HideUIPanel, ProfessionsFrame)
-	end
-end
-
-local function SnapshotAlchemy()
-	if weOpenedProfession then return end
-	if ahOpen then return end
-	if InCombatLockdown and InCombatLockdown() then
-		eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-		return
-	end
-	if PlayerHasAlchemy() == false then return end
-	if not (C_TradeSkillUI and C_TradeSkillUI.OpenTradeSkill) then return end
-	if C_AddOns and C_AddOns.LoadAddOn then
-		pcall(C_AddOns.LoadAddOn, "Blizzard_Professions")
-	elseif UIParentLoadAddOn then
-		pcall(UIParentLoadAddOn, "Blizzard_Professions")
-	end
-	weOpenedProfession = true
-	local skillLine = AlchemySkillLine()
-	local ok = pcall(C_TradeSkillUI.OpenTradeSkill, skillLine)
-	if not ok then
-		weOpenedProfession = false
-		return
-	end
-	C_Timer.After(6, CloseProfessionIfWeOpenedIt)
-end
-
-local function OnProfessionUpdate()
-	if not OpenProfessionIsAlchemy() then return end
-	if C_TradeSkillUI and C_TradeSkillUI.IsTradeSkillReady and not C_TradeSkillUI.IsTradeSkillReady() then
-		return
-	end
-	local list = ReadOpenAlchemy()
-	if not list then return end
-	if #list > 0 then
-		UseRecipes(list, true)
-		if frame and frame:IsShown() then
-			frame:Refresh()
-		end
-	end
-	-- Only close the window when this addon opened it. A list of zero still
-	-- means the read finished, so don't leave a hidden profession window up.
-	if weOpenedProfession then
-		CloseProfessionIfWeOpenedIt()
-	end
-end
-
-local function OnNewRecipe(recipeID)
-	if type(recipeID) ~= "number" then return end
-	if not (C_TradeSkillUI and C_TradeSkillUI.GetProfessionInfoByRecipeID) then return end
-	local ok, info = pcall(C_TradeSkillUI.GetProfessionInfoByRecipeID, recipeID)
-	if not ok or not IsAlchemyInfo(info) then return end
-	local recipe = ReadSchematic(recipeID)
-	if not recipe then return end
-	UseRecipes({ recipe }, false)
-	if frame and frame:IsShown() then
-		frame:Refresh()
 	end
 end
 
@@ -702,6 +644,69 @@ local function StopScan()
 	searchPendingStep = nil
 	wipe(searchQueue)
 	wipe(searchSeen)
+end
+
+local function NoteRecipes(list)
+	for i = 1, #list do
+		NoteItem(list[i].outputItemID)
+		for n = 1, #list[i].reagents do
+			NoteItem(list[i].reagents[n].itemID)
+		end
+	end
+end
+
+local function RestoreLastProfession()
+	local record = CharacterRecord()
+	if not record then return end
+	local skill = record.activeSkill
+	if type(skill) ~= "number" and type(record.professions) == "table" then
+		for id in pairs(record.professions) do
+			if type(id) == "number" then
+				skill = id
+				break
+			end
+		end
+	end
+	if type(skill) ~= "number" then return end
+	activeSkill = skill
+	local bucket = record.professions[skill]
+	activeName = (bucket and bucket.name) or "Profession"
+	recipes = LoadSavedRecipes()
+	NoteRecipes(recipes)
+end
+
+-- Replace the window with only the profession that is open. Never keep
+-- another profession's recipes on screen or fold them into this list.
+local function AdoptOpenProfession()
+	local skillLine, name = CurrentProfession()
+	if not skillLine then return false end
+	local list = ReadOpenProfession()
+	if not list then return false end
+	local switched = activeSkill ~= skillLine or activeName ~= name
+	if switched and scanMode == "search" then
+		StopScan()
+	end
+	if switched then
+		recipes = {}
+	end
+	activeSkill = skillLine
+	activeName = name
+	if #list == 0 then
+		return true
+	end
+	UseRecipes(list, true)
+	return true
+end
+
+local function OnProfessionUpdate()
+	if not AdoptOpenProfession() then return end
+	if frame and frame:IsShown() then
+		frame:Refresh()
+	end
+end
+
+local function OnNewRecipe()
+	OnProfessionUpdate()
 end
 
 local function ScheduleRefresh()
@@ -947,14 +952,15 @@ local function PumpSearch()
 end
 
 local function StatusText()
-	if PlayerHasAlchemy() == false and #recipes == 0 then
-		return "Alchemy is not one of your professions."
-	end
 	if #recipes == 0 then
-		return "No alchemy recipes read yet. Open your Alchemy window once, then open the auction house again."
+		local _, openName = CurrentProfession()
+		if openName then
+			return openName .. " is open, but it has no item recipes to price."
+		end
+		return "Open a profession window beside the auction house, then press Scan."
 	end
 	local profitable, losing, incomplete = ProfitCounts()
-	local summary = profitable .. " profitable, " .. losing .. " losing money"
+	local summary = (activeName or "Profession") .. ": " .. profitable .. " profitable, " .. losing .. " losing money"
 	if incomplete > 0 then
 		summary = summary .. ", " .. incomplete .. " missing a price"
 	end
@@ -1199,7 +1205,7 @@ local function BuildFrame()
 
 	main.title = main:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	main.title:SetPoint("TOPLEFT", 16, -12)
-	main.title:SetText("Alchemy Profit")
+	main.title:SetText("AH Scanner")
 	main.title:SetTextColor(0.92, 0.92, 0.92)
 
 	main.close = CreateFrame("Button", nil, main, "UIPanelCloseButton")
@@ -1241,7 +1247,18 @@ local function BuildFrame()
 	main.refresh.label:SetTextColor(0.9, 0.9, 0.9)
 	main.refresh:SetScript("OnClick", function()
 		if not ahOpen then
-			print("|cff33ccffAH Scanner:|r open the auction house to price recipes.")
+			print("|cff33ccffAH Scanner:|r open the auction house, then open a profession and press Scan.")
+			return
+		end
+		if not CurrentProfession() then
+			print("|cff33ccffAH Scanner:|r open a profession window. Scan only prices that profession.")
+			if frame then frame:Refresh() end
+			return
+		end
+		AdoptOpenProfession()
+		if #recipes == 0 then
+			print("|cff33ccffAH Scanner:|r that profession has no item recipes to price.")
+			if frame then frame:Refresh() end
 			return
 		end
 		BeginPriceScan()
@@ -1318,6 +1335,9 @@ local function BuildFrame()
 
 	function main:Refresh()
 		if not self:IsShown() then return end
+		if self.title then
+			self.title:SetText(activeName and (activeName .. " Profit") or "AH Scanner")
+		end
 		self.status:SetText(StatusText())
 		self.note:SetText(NoteText())
 		local list = SortedRecipes()
@@ -1440,16 +1460,10 @@ local function ToggleWindow()
 		return
 	end
 	DetectMarket()
-	if #recipes == 0 then
-		recipes = LoadSavedRecipes()
-		for i = 1, #recipes do
-			NoteItem(recipes[i].outputItemID)
-			for n = 1, #recipes[i].reagents do
-				NoteItem(recipes[i].reagents[n].itemID)
-			end
-		end
-	end
 	LoadMarketPrices()
+	if not AdoptOpenProfession() and #recipes == 0 then
+		RestoreLastProfession()
+	end
 	ShowWindow()
 end
 
@@ -1518,28 +1532,10 @@ end
 local function PrepareAndScan()
 	DetectMarket()
 	LoadMarketPrices()
-	local live = TryProfessionSpells()
-	if live and #live > 0 then
-		local saved = LoadSavedRecipes()
-		UseRecipes(live, #live >= #saved)
-	else
-		local openList = ReadOpenAlchemy()
-		if openList and #openList > 0 then
-			UseRecipes(openList, true)
-		else
-			recipes = LoadSavedRecipes()
-			for i = 1, #recipes do
-				NoteItem(recipes[i].outputItemID)
-				for n = 1, #recipes[i].reagents do
-					NoteItem(recipes[i].reagents[n].itemID)
-				end
-			end
-		end
+	if not AdoptOpenProfession() then
+		RestoreLastProfession()
 	end
 	ShowWindow()
-	if #recipes == 0 and PlayerHasAlchemy() ~= false and not ahOpen then
-		SnapshotAlchemy()
-	end
 end
 
 local function OnAuctionShow()
@@ -1553,36 +1549,19 @@ local function OnAuctionClosed()
 	if frame then
 		frame:Hide()
 	end
-	if #LoadSavedRecipes() == 0 and PlayerHasAlchemy() ~= false then
-		C_Timer.After(0.5, SnapshotAlchemy)
-	end
-end
-
-local function ScheduleSnapshot()
-	if snapshotAttempted then return end
-	if PlayerHasAlchemy() == false then return end
-	if #LoadSavedRecipes() > 0 then return end
-	snapshotAttempted = true
-	if InCombatLockdown and InCombatLockdown() then
-		eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-		return
-	end
-	C_Timer.After(2, function()
-		if not ahOpen then
-			SnapshotAlchemy()
-		end
-	end)
 end
 
 local function Slash(message)
 	message = message and message:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
 	if message == "learn" or message == "recipes" then
-		if ahOpen then
-			print("|cff33ccffAH Scanner:|r close the auction house first. Reading Alchemy would close it.")
+		if not AdoptOpenProfession() then
+			print("|cff33ccffAH Scanner:|r open a profession window first.")
 			return
 		end
-		SnapshotAlchemy()
-		print("|cff33ccffAH Scanner:|r opening Alchemy to read your recipes.")
+		if frame and frame:IsShown() then
+			frame:Refresh()
+		end
+		print("|cff33ccffAH Scanner:|r read " .. (activeName or "that profession") .. ". Press Scan at the auction house to price it.")
 		return
 	end
 	ToggleWindow()
@@ -1609,19 +1588,10 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2)
 		InitDB()
 		CreateMinimapButton()
 		self:UnregisterEvent("ADDON_LOADED")
-		if IsLoggedIn and IsLoggedIn() then
-			ScheduleSnapshot()
-		end
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		if db then
 			CreateMinimapButton()
 			UpdateMinimapButton()
-			ScheduleSnapshot()
-		end
-	elseif event == "PLAYER_REGEN_ENABLED" then
-		self:UnregisterEvent("PLAYER_REGEN_ENABLED")
-		if not ahOpen then
-			SnapshotAlchemy()
 		end
 	elseif event == "AUCTION_HOUSE_SHOW" then
 		OnAuctionShow()
