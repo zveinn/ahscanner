@@ -229,6 +229,32 @@ local function HouseCut(amount)
 	return math.floor(amount * cutPercent / 100 + 1e-6)
 end
 
+-- Copper a vendor pays for one of this item. Nil until the client knows the item.
+local function VendorSell(itemID)
+	if not itemID then return nil end
+	local sell
+	if type(GetItemInfo) == "function" then
+		local ok, _, _, _, _, _, _, _, _, _, _, price = pcall(GetItemInfo, itemID)
+		if ok and type(price) == "number" then
+			sell = price
+		end
+	end
+	if sell == nil and C_Item and C_Item.GetItemInfo then
+		local ok, a, _, _, _, _, _, _, _, _, _, price = pcall(C_Item.GetItemInfo, itemID)
+		if ok then
+			if type(a) == "table" and type(a.sellPrice) == "number" then
+				sell = a.sellPrice
+			elseif type(price) == "number" then
+				sell = price
+			end
+		end
+	end
+	if sell == nil then
+		return nil
+	end
+	return sell
+end
+
 local function PlainMoney(copper)
 	local gold = math.floor(copper / 10000)
 	local silver = math.floor((copper % 10000) / 100)
@@ -581,23 +607,60 @@ local function Evaluate(recipe)
 	end
 	recipe.cost = cost
 	recipe.missing = missing
+	local count = recipe.outputCount or 1
+
 	local sellUnit = prices[recipe.outputItemID]
 	if type(sellUnit) ~= "number" then
 		recipe.sale = nil
 		recipe.profit = nil
-		recipe.tier = 3
 		recipe.sellState = sellUnit == false and "missing" or "pending"
-		return
-	end
-	local gross = sellUnit * recipe.outputCount
-	recipe.sale = gross - HouseCut(gross)
-	recipe.sellState = "auction"
-	if missing then
-		recipe.profit = nil
-		recipe.tier = 3
 	else
-		recipe.profit = recipe.sale - cost
-		recipe.tier = recipe.profit > 0 and 1 or 2
+		local gross = sellUnit * count
+		recipe.sale = gross - HouseCut(gross)
+		recipe.sellState = "auction"
+		if missing then
+			recipe.profit = nil
+			recipe.sellState = "incomplete"
+		else
+			recipe.profit = recipe.sale - cost
+		end
+	end
+
+	local vendorUnit = VendorSell(recipe.outputItemID)
+	if vendorUnit == nil then
+		RequestItem(recipe.outputItemID)
+		recipe.vendorSale = nil
+		recipe.vendorProfit = nil
+		recipe.vendorState = "pending"
+	elseif vendorUnit <= 0 then
+		recipe.vendorSale = 0
+		recipe.vendorProfit = nil
+		recipe.vendorState = "none"
+	else
+		recipe.vendorSale = vendorUnit * count
+		if missing then
+			recipe.vendorProfit = nil
+			recipe.vendorState = "incomplete"
+		else
+			recipe.vendorProfit = recipe.vendorSale - cost
+			recipe.vendorState = "known"
+		end
+	end
+
+	local best = nil
+	if type(recipe.profit) == "number" then
+		best = recipe.profit
+	end
+	if type(recipe.vendorProfit) == "number" and (best == nil or recipe.vendorProfit > best) then
+		best = recipe.vendorProfit
+	end
+	recipe.best = best
+	if best == nil then
+		recipe.tier = 3
+	elseif best > 0 then
+		recipe.tier = 1
+	else
+		recipe.tier = 2
 	end
 end
 
@@ -611,7 +674,7 @@ local function SortedRecipes()
 		if a.tier ~= b.tier then
 			return a.tier < b.tier
 		end
-		local pa, pb = a.profit, b.profit
+		local pa, pb = a.best, b.best
 		if pa ~= pb then
 			if pa == nil then return false end
 			if pb == nil then return true end
@@ -986,7 +1049,7 @@ end
 
 local function NoteText()
 	local house = cutPercent == 15 and "Neutral auction house keeps 15%." or "Faction auction house keeps 5%."
-	return house .. " Each recipe is priced one ingredient at a time. Profit uses the cheapest listing after that cut. Vials use the vendor price when it is lower. The deposit is not part of the profit."
+	return house .. " AH is the profit after that cut. Vendor is what a merchant pays for the crafted item. A recipe is listed first when either one makes money."
 end
 
 local function CreateRow(parent)
@@ -1014,8 +1077,8 @@ local function CreateRow(parent)
 	row.bar:SetWidth(4)
 
 	row.icon = CreateFrame("Button", nil, row.content)
-	row.icon:SetSize(36, 36)
-	row.icon:SetPoint("TOPLEFT", 14, -8)
+	row.icon:SetSize(22, 22)
+	row.icon:SetPoint("TOPLEFT", 12, -6)
 	row.icon.texture = row.icon:CreateTexture(nil, "ARTWORK")
 	row.icon.texture:SetAllPoints()
 	row.icon:SetScript("OnEnter", function(self)
@@ -1032,45 +1095,62 @@ local function CreateRow(parent)
 		GameTooltip:Hide()
 	end)
 
-	row.body = row.content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	row.body:SetPoint("TOPLEFT", 56, -8)
-	row.body:SetPoint("TOPRIGHT", -10, -8)
-	row.body:SetJustifyH("LEFT")
-	row.body:SetJustifyV("TOP")
-	row.body:SetWordWrap(true)
-	if row.body.SetSpacing then
-		row.body:SetSpacing(2)
-	end
+	row.vendor = row.content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	row.vendor:SetPoint("TOPRIGHT", -8, -6)
+	row.vendor:SetWidth(84)
+	row.vendor:SetJustifyH("RIGHT")
+	row.vendor:SetWordWrap(false)
+
+	row.ah = row.content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	row.ah:SetPoint("TOPRIGHT", -98, -6)
+	row.ah:SetWidth(84)
+	row.ah:SetJustifyH("RIGHT")
+	row.ah:SetWordWrap(false)
+
+	row.name = row.content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	row.name:SetPoint("TOPLEFT", 40, -7)
+	row.name:SetPoint("RIGHT", row.ah, "LEFT", -8, 0)
+	row.name:SetJustifyH("LEFT")
+	row.name:SetWordWrap(false)
+	row.name:SetTextColor(1, 0.86, 0.55)
+
+	row.reagents = row.content:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	row.reagents:SetPoint("TOPLEFT", 40, -24)
+	row.reagents:SetPoint("TOPRIGHT", -8, -24)
+	row.reagents:SetJustifyH("LEFT")
+	row.reagents:SetJustifyV("TOP")
+	row.reagents:SetWordWrap(true)
+	row.reagents:SetTextColor(0.62, 0.62, 0.62)
 
 	return row
 end
 
-local function CostText(recipe)
-	if not recipe.missing then
-		return MoneyText(recipe.cost)
+local function ProfitValue(amount, state)
+	if state == "pending" or state == "incomplete" then
+		return "|cff777777...|r"
 	end
-	if recipe.cost and recipe.cost > 0 then
-		return MoneyText(recipe.cost) .. "|cff888888+|r"
+	if type(amount) ~= "number" then
+		return "|cff555555—|r"
 	end
-	return "|cff888888-|r"
+	if amount > 0 then
+		return "|cff3dcc66+" .. MoneyText(amount) .. "|r"
+	end
+	return "|cffff6666" .. MoneyText(amount) .. "|r"
 end
 
-local function ReagentLine(reagent)
-	local prefix = reagent.count .. "x " .. ItemName(reagent.itemID) .. "  "
+local function ReagentBit(reagent)
+	local price
 	if reagent.source == "pending" then
-		return prefix .. "|cff888888...|r"
+		price = "|cff777777...|r"
+	elseif not reagent.unit then
+		price = "|cff555555—|r"
+	else
+		price = MoneyText(reagent.unit)
+		if reagent.source == "vendor" then
+			price = price .. "|cffddcc88v|r"
+		end
 	end
-	if not reagent.unit then
-		return prefix .. "|cff888888not listed|r"
-	end
-	local text = prefix .. MoneyText(reagent.unit)
-	if reagent.count > 1 then
-		text = text .. " each (" .. MoneyText(reagent.line) .. ")"
-	end
-	if reagent.source == "vendor" then
-		text = text .. "  |cffddcc88vendor|r"
-	end
-	return text
+	return reagent.count .. " " .. ItemName(reagent.itemID) .. " " .. price
 end
 
 local function FillRow(row, recipe)
@@ -1082,49 +1162,41 @@ local function FillRow(row, recipe)
 
 	local name = ItemName(recipe.outputItemID)
 	if outputMax > outputCount then
-		name = name .. "  |cffaaaaaa(makes " .. outputCount .. "-" .. outputMax .. ")|r"
+		name = name .. "  |cff777777" .. outputCount .. "–" .. outputMax .. "|r"
 	elseif outputCount > 1 then
-		name = name .. "  |cffaaaaaax" .. outputCount .. "|r"
+		name = name .. "  |cff777777x" .. outputCount .. "|r"
 	end
+	row.name:SetText(name)
 
-	local profitText
 	if recipe.tier == 1 then
-		row.bar:SetVertexColor(0.2, 0.85, 0.25, 1)
-		profitText = "|cff33ee55+" .. MoneyText(recipe.profit) .. "|r"
+		row.bar:SetVertexColor(0.25, 0.8, 0.35, 1)
 	elseif recipe.tier == 2 then
-		row.bar:SetVertexColor(0.9, 0.25, 0.2, 1)
-		profitText = "|cffff5555" .. MoneyText(recipe.profit) .. "|r"
+		row.bar:SetVertexColor(0.85, 0.28, 0.22, 1)
 	else
-		row.bar:SetVertexColor(0.45, 0.45, 0.45, 1)
-		profitText = "|cff888888need prices|r"
+		row.bar:SetVertexColor(0.35, 0.35, 0.35, 1)
 	end
+	row.ah:SetText(ProfitValue(recipe.profit, recipe.sellState))
+	row.vendor:SetText(ProfitValue(recipe.vendorProfit, recipe.vendorState))
 
-	local costText = CostText(recipe)
-	local summary
-	if recipe.sale then
-		local yield = outputCount > 1 and (outputCount .. " for ") or ""
-		summary = "Cost " .. costText .. "    Sell " .. yield .. MoneyText(recipe.sale) .. " after cut"
-	elseif recipe.sellState == "missing" then
-		summary = "Cost " .. costText .. "    |cff888888not listed on the auction house|r"
+	local bits = {}
+	local cost = "|cff888888Cost "
+	if recipe.missing and recipe.cost and recipe.cost > 0 then
+		cost = cost .. MoneyText(recipe.cost) .. "+|r"
+	elseif recipe.missing then
+		cost = cost .. "—|r"
 	else
-		summary = "Cost " .. costText .. "    Sell |cff888888...|r"
+		cost = cost .. MoneyText(recipe.cost or 0) .. "|r"
 	end
-	if outputMax > outputCount then
-		summary = summary .. "   |cffaaaaaapriced at " .. outputCount .. "|r"
-	end
-
-	local lines = {
-		"|cffffd100" .. name .. "|r    " .. profitText,
-		summary,
-	}
+	bits[1] = cost
 	for i = 1, #recipe.reagents do
-		lines[#lines + 1] = ReagentLine(recipe.reagents[i])
+		bits[#bits + 1] = ReagentBit(recipe.reagents[i])
 	end
-	row.body:SetText(table.concat(lines, "\n"))
-	local textHeight = 4 + (#lines * 16)
-	row.body:SetHeight(textHeight)
-	local height = 16 + textHeight
-	if height < 78 then height = 78 end
+	row.reagents:SetText(table.concat(bits, "   "))
+	local textHeight = row.reagents:GetStringHeight() or 14
+	if textHeight < 12 then textHeight = 14 end
+	row.reagents:SetHeight(textHeight)
+	local height = 28 + textHeight
+	if height < 44 then height = 44 end
 	row:SetHeight(height)
 end
 
@@ -1180,7 +1252,7 @@ end
 
 local function BuildFrame()
 	local main = CreateFrame("Frame", "AHScannerFrame", UIParent, "BackdropTemplate")
-	main:SetSize(560, 640)
+	main:SetSize(640, 640)
 	main:SetFrameStrata("HIGH")
 	main:SetToplevel(true)
 	main:SetMovable(true)
@@ -1227,7 +1299,7 @@ local function BuildFrame()
 	main.note:SetPoint("RIGHT", main, "RIGHT", -16, 0)
 	main.note:SetJustifyH("LEFT")
 	main.note:SetWordWrap(true)
-	main.note:SetHeight(28)
+	main.note:SetHeight(32)
 	main.note:SetTextColor(0.55, 0.55, 0.55)
 
 	main.refresh = CreateFrame("Button", nil, main, "BackdropTemplate")
@@ -1271,7 +1343,7 @@ local function BuildFrame()
 	end)
 
 	main.scroll = CreateFrame("ScrollFrame", "AHScannerScrollFrame", main, "UIPanelScrollFrameTemplate")
-	main.scroll:SetPoint("TOPLEFT", 10, -104)
+	main.scroll:SetPoint("TOPLEFT", 10, -122)
 	main.scroll:SetPoint("BOTTOMRIGHT", -28, 12)
 	main.scroll:SetFrameLevel(main:GetFrameLevel() + 5)
 	main.scroll:EnableMouse(true)
@@ -1310,6 +1382,25 @@ local function BuildFrame()
 		end
 	end
 
+	main.headVendor = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	main.headVendor:SetPoint("BOTTOMRIGHT", main.scroll, "TOPRIGHT", -12, 4)
+	main.headVendor:SetWidth(84)
+	main.headVendor:SetJustifyH("RIGHT")
+	main.headVendor:SetText("Vendor")
+	main.headVendor:SetTextColor(0.65, 0.78, 0.9)
+
+	main.headAH = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	main.headAH:SetPoint("RIGHT", main.headVendor, "LEFT", -6, 0)
+	main.headAH:SetWidth(84)
+	main.headAH:SetJustifyH("RIGHT")
+	main.headAH:SetText("AH")
+	main.headAH:SetTextColor(0.9, 0.78, 0.45)
+
+	main.headRecipe = main:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	main.headRecipe:SetPoint("BOTTOMLEFT", main.scroll, "TOPLEFT", 40, 4)
+	main.headRecipe:SetText("Recipe")
+	main.headRecipe:SetTextColor(0.55, 0.55, 0.55)
+
 	main.content = CreateFrame("Frame", nil, main.scroll)
 	main.content:SetSize(480, 1)
 	main.content:EnableMouse(false)
@@ -1341,8 +1432,8 @@ local function BuildFrame()
 		self.status:SetText(StatusText())
 		self.note:SetText(NoteText())
 		local list = SortedRecipes()
-		local width = self:GetWidth() - 52
-		if not width or width < 200 then width = 500 end
+		local width = self.scroll:GetWidth()
+		if not width or width < 200 then width = self:GetWidth() - 40 end
 		self.content:SetWidth(width)
 		local y = -4
 		for i = 1, #list do
@@ -1356,7 +1447,8 @@ local function BuildFrame()
 			row:SetPoint("TOPRIGHT", -4, y)
 			local ok, err = pcall(FillRow, row, list[i])
 			if not ok then
-				row.body:SetText("|cffff8080Could not draw this recipe.|r\n" .. tostring(err))
+				row.name:SetText("|cffff8080Could not draw this recipe|r")
+				row.reagents:SetText(tostring(err))
 				row:SetHeight(64)
 			end
 			row:Show()
