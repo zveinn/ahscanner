@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: AH Scanner
+## Notes: When you open the auction house, prices your known alchemy recipes and shows craft-and-sell profit.
+## Author: AH Scanner
+## Version: 1.0.0
+## SavedVariables: AHScannerDB
+## Category: Professions
+
+AHScanner.lua
